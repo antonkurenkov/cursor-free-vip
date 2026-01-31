@@ -64,7 +64,7 @@ Write-Host "Created by YeongPin`n" -ForegroundColor $Theme.Info
 # Set TLS 1.2
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-# Function to extract ZIP file
+# Function to extract ZIP file with overwrite support
 function Expand-ZipFile {
     param(
         [string]$ZipFile,
@@ -77,11 +77,81 @@ function Expand-ZipFile {
         # Create destination directory if it doesn't exist
         if (-not (Test-Path $Destination)) {
             New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+        } else {
+            Write-Styled "Destination folder already exists, cleaning old files..." -Color $Theme.Warning -Prefix "Cleanup"
         }
         
-        # Extract ZIP
+        # Extract ZIP with overwrite support
         Add-Type -AssemblyName System.IO.Compression.FileSystem
-        [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipFile, $Destination)
+        
+        # Open ZIP archive
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipFile)
+        
+        try {
+            foreach ($entry in $zip.Entries) {
+                $entryPath = Join-Path $Destination $entry.FullName
+                $entryDir = Split-Path $entryPath -Parent
+                
+                # Create directory if it doesn't exist
+                if (-not (Test-Path $entryDir)) {
+                    New-Item -ItemType Directory -Path $entryDir -Force | Out-Null
+                }
+                
+                # Skip directories
+                if (-not [string]::IsNullOrEmpty($entry.Name)) {
+                    # Extract file with overwrite
+                    try {
+                        [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $entryPath, $true)
+                    }
+                    catch {
+                        Write-Styled "Warning: Could not extract $($entry.Name): $($_.Exception.Message)" -Color $Theme.Warning -Prefix "Warning"
+                    }
+                }
+            }
+        }
+        finally {
+            $zip.Dispose()
+        }
+        
+        Write-Styled "Extraction completed" -Color $Theme.Success -Prefix "Extract"
+        return $true
+    }
+    catch {
+        Write-Styled "Failed to extract ZIP: $($_.Exception.Message)" -Color $Theme.Error -Prefix "Error"
+        return $false
+    }
+}
+
+# Alternative function using Shell.Application (more compatible)
+function Expand-ZipFileCompatible {
+    param(
+        [string]$ZipFile,
+        [string]$Destination
+    )
+    
+    try {
+        Write-Styled "Extracting ZIP file (compatible method)..." -Color $Theme.Primary -Prefix "Extract"
+        
+        # Create destination directory if it doesn't exist
+        if (-not (Test-Path $Destination)) {
+            New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+        }
+        
+        # Use Shell.Application for extraction (supports overwrite)
+        $shell = New-Object -ComObject Shell.Application
+        $zip = $shell.NameSpace($ZipFile)
+        
+        # Copy all items with overwrite flag (16 = 4 (NoProgressDialog) + 16 (YesToAll))
+        $flags = 20  # 4 + 16
+        
+        foreach ($item in $zip.Items()) {
+            $shell.NameSpace($Destination).CopyHere($item, $flags)
+            # Small delay to avoid issues
+            Start-Sleep -Milliseconds 100
+        }
+        
+        # Release COM object
+        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($shell) | Out-Null
         
         Write-Styled "Extraction completed" -Color $Theme.Success -Prefix "Extract"
         return $true
@@ -119,6 +189,21 @@ function Install-CursorFreeVIP {
         $downloadPath = Join-Path $DownloadsPath "CursorFreeVIP_${version}_windows.zip"
         $extractPath = Join-Path $DownloadsPath "CursorFreeVIP_${version}"
         
+        # Clean old extraction if exists and user wants to
+        if (Test-Path $extractPath) {
+            Write-Styled "Previous extraction found. Delete old files? (Y/N)" -Color $Theme.Warning -Prefix "Cleanup"
+            $response = Read-Host "Press Y to delete or N to keep"
+            if ($response -eq 'Y' -or $response -eq 'y') {
+                try {
+                    Remove-Item -Path $extractPath -Recurse -Force -ErrorAction Stop
+                    Write-Styled "Old files deleted successfully" -Color $Theme.Success -Prefix "Cleanup"
+                }
+                catch {
+                    Write-Styled "Could not delete old files: $($_.Exception.Message)" -Color $Theme.Error -Prefix "Warning"
+                }
+            }
+        }
+        
         if (Test-Path $downloadPath) {
             Write-Styled "Found existing ZIP file" -Color $Theme.Success -Prefix "Found"
             Write-Styled "Location: $downloadPath" -Color $Theme.Info -Prefix "Location"
@@ -141,7 +226,7 @@ function Install-CursorFreeVIP {
             Register-ObjectEvent -InputObject $webClient -EventName DownloadProgressChanged -Action {
                 $Global:downloadedBytes = $EventArgs.BytesReceived
                 $Global:totalBytes = $EventArgs.TotalBytesToReceive
-                $progress = [math]::Round(($Global:downloadedBytes / $Global:totalBytes) * 100, 1)
+                $progress = [math]::Round(($Global:downloadedBytes / $Global.totalBytes) * 100, 1)
                 
                 # Only update display when progress changes by more than 1%
                 if ($progress -gt $Global:lastProgress + 1) {
@@ -194,7 +279,26 @@ function Install-CursorFreeVIP {
         
         # Extract ZIP file
         Write-Styled "Extracting files..." -Color $Theme.Primary -Prefix "Extract"
-        if (Expand-ZipFile -ZipFile $downloadPath -Destination $extractPath) {
+        
+        # Try first method, if fails try second method
+        $success = $false
+        
+        try {
+            # First try with .NET method
+            if (Expand-ZipFile -ZipFile $downloadPath -Destination $extractPath) {
+                $success = $true
+            }
+        }
+        catch {
+            Write-Styled "First extraction method failed, trying alternative..." -Color $Theme.Warning -Prefix "Warning"
+            
+            # Try with Shell.Application method
+            if (Expand-ZipFileCompatible -ZipFile $downloadPath -Destination $extractPath) {
+                $success = $true
+            }
+        }
+        
+        if ($success) {
             Write-Styled "Files extracted to: $extractPath" -Color $Theme.Success -Prefix "Extract"
             
             # Look for executable in extracted files
@@ -231,8 +335,28 @@ function Install-CursorFreeVIP {
                 # If already running with administrator privileges, start directly
                 Start-Process $exePath
             } else {
-                Write-Styled "No executable found in extracted files. Opening extraction folder..." -Color $Theme.Warning -Prefix "Warning"
-                Start-Process $extractPath
+                # Also look for .bat files
+                $batFiles = Get-ChildItem -Path $extractPath -Filter "*.bat" -Recurse -File | Select-Object -First 1
+                if ($batFiles) {
+                    Write-Styled "Found batch file: Launcher.bat" -Color $Theme.Success -Prefix "Found"
+                    Write-Styled "Opening folder with instructions..." -Color $Theme.Info -Prefix "Info"
+                    
+                    # Show message about Launcher.bat
+                    Write-Host "`n" -NoNewline
+                    Write-Host "="*50 -ForegroundColor Cyan
+                    Write-Host "INSTRUCTIONS:" -ForegroundColor Yellow
+                    Write-Host "- Open the folder: $extractPath" -ForegroundColor White
+                    Write-Host "- Run 'Launcher.bat' as Administrator" -ForegroundColor White
+                    Write-Host "- Follow the on-screen instructions" -ForegroundColor White
+                    Write-Host "="*50 -ForegroundColor Cyan
+                    Write-Host "`n"
+                    
+                    # Open folder
+                    Start-Process $extractPath
+                } else {
+                    Write-Styled "No executable or batch file found. Opening extraction folder..." -Color $Theme.Warning -Prefix "Warning"
+                    Start-Process $extractPath
+                }
             }
         }
     }
